@@ -28,7 +28,7 @@ pip install -r requirements.txt
 
 ```bash
 # Default output
-python -m rover.cli --input data/data.csv
+python -m rover.cli --input data/reviews.csv
 
 # Custom output
 python -m rover.cli --input input/data.csv --output output/my_custom_output.csv
@@ -50,12 +50,12 @@ pytest --cov=rover/services --cov=rover/utils --cov-fail-under=80
 ### Automation & Code Quality
 ### This project includes full pre-commit automation and code quality tools:
 
-Tool_________________|Purpose________________
-black	                Auto-code formatter
-flake8	              Linter for code style
-mypy	                Static type checker
-pytest	              Unit testing framework
-pre-commit	          Automates quality checks on commit
+| Tool         | Purpose                          | Config Location     | Enforced in Pre-Commit |
+|--------------|-----------------------------------|----------------------|------------------------|
+| `black`      | Code autoformatter (PEP8 + 88 cols) | `.pre-commit-config.yaml` |  
+| `pytest`     | Unit tests runner                 | N/A                  |
+| `pytest-cov` | Code coverage enforcement (80%)  | `.pre-commit-config.yaml`  |
+| `pre-commit` | Hook runner for automation        | `.pre-commit-config.yaml` |
 
 ```bash
 pre-commit run --all-files
@@ -74,7 +74,6 @@ pre-commit run --all-files
   - `dogs`: dogs involved in the stay
   - `text`: customer review comment
 
----
 
 ## Scoring Algorithm
 
@@ -109,10 +108,107 @@ and display them through a web UI.
 
 Please answer ONE of the following questions on how you would approach the design:
 
-1. **How would you adjust the calculation and storage of search scores in a production application?**
+**How would you adjust the calculation and storage of search scores in a production application?**
 
-2. **Describe a technical implementation for the frontend you would use to display a list of sitters and their scores. How would the frontend manage state as users interact with a page?**
+### System Requirements
 
-2. **What infrastructure choices might you make to build and host this project at scale? Suppose your web application must return fast search results with a peak of 10 searches per second.**
+- The Search Score combines both static data (sitter name) and dynamic data (reviews).
+- Search operations require fast query performance and low latency.
+- Updates to Search Score are triggered only when new reviews are submitted or existing reviews are modified.
+- The system must remain scalable as the dataset grows (more sitters and reviews).
 
-4. **Describe how you would approach API design for a backend service to provide sitter and rank data to a client/web frontend.**
+### Proposed Architecture
+
+#### Decouple Review Ingestion and Score Calculation
+
+- Each time a new review is submitted, it is written to a normalized `reviews` table in a relational database.
+- After writing the review, the service publishes an event (`ReviewCreated`) into a message queue (Kafka, RabbitMQ, or AWS SNS/SQS).
+
+#### Asynchronous Score Calculation
+
+- A dedicated worker service listens to the event queue.
+- When triggered, the worker retrieves all reviews for the corresponding sitter, recalculates:
+  - Ratings Score
+  - Search Score
+- Profile Score is static and calculated once at sitter creation.
+
+#### Precomputed Scores Storage
+
+- The recalculated scores are written into a materialized `sitter_scores` table:
+
+```sql
+sitter_scores (
+  sitter_id PK,
+  profile_score FLOAT,
+  ratings_score FLOAT,
+  search_score FLOAT,
+  last_updated TIMESTAMP
+)
+```
+
+#### Search Service Read Path
+
+- The search API queries directly the precomputed `sitter_scores` table.
+- This allows very fast search query response times.
+
+#### Caching Layer (Optional)
+
+- Redis or Memcached can be added to cache frequent search queries or hot sitter profiles.
+
+#### Monitoring & Logging
+- Centralized logging using ELK stack (Elasticsearch, Logstash, Kibana) or modern SaaS (e.g. Datadog, New Relic, Splunk).
+
+#### Architecture components
+| Component       | Description |
+|------------------|-------------|
+| **Frontend Web Application** | Web UI for end-users to browse sitter search results |
+| **API Gateway / Load Balancer** | Routes incoming HTTP requests to backend services |
+| **Search API Service** | Stateless service serving search results, reading precomputed scores |
+| **Relational Database** | Stores normalized `sitters` and `reviews` tables |
+| **Precomputed Scores Table** | Materialized `sitter_scores` table for fast search reads |
+| **Message Queue** | Decouples review ingestion and scoring updates |
+| **Score Calculation Worker** | Listens to queue events and recalculates sitter scores asynchronously |
+| **Redis Cache** | Caches hot sitter scores and frequent search queries |
+| **Monitoring & Logging Stack** | Centralized observability using Prometheus, Grafana, ELK stack | 
+
+
+### Data Flow Overview
+
+**Review Submission**
+- User submits a review via frontend.
+- Review is written into `reviews` table.
+- Review event (`ReviewCreated`) is published into message queue.
+
+**Score Calculation**
+- Worker service consumes `ReviewCreated` events.
+- Worker fetches sitter's reviews, recalculates scores.
+- Updated scores are written into `sitter_scores` table.
+
+**Search Requests**
+
+- User submits search query via web UI.
+- Search API queries `sitter_scores` directly.
+- Redis is used to cache frequent search results.
+
+### Simplified Architecture Diagram Search scores
+
+  ┌──────────┐       ┌──────────────┐       ┌──────────────┐
+  │ Frontend │ <---> │  API Gateway │ <---> │  Search API  │
+  └──────────┘       └──────────────┘       └────┬─────────┘
+                                                 │
+                                       ┌──────────▼──────────┐
+                                       │ sitter_scores Table │
+                                       └──────────┬──────────┘
+                                                  │
+                                       ┌──────────▼──────────┐
+                                       │      Redis Cache    │
+                                       └──────────┬──────────┘
+                                                  │
+┌──────────┐     ┌──────────────┐     ┌───────────▼──────────┐
+│  Review  │ --> │ Message Queue │ --> │ Score Calculation    │
+│ Submission│     │ (Kafka/SQS) │     │ Worker Service       │
+└──────────┘     └──────────────┘     └───────────┬──────────┘
+                                                  │
+                                       ┌──────────▼──────────┐
+                                       │  Reviews Table      │
+                                       └─────────────────────┘
